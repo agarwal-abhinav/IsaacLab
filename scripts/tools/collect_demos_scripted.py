@@ -141,7 +141,7 @@ import torch
 
 import isaaclab.utils.math as math_utils
 from isaaclab.envs.mdp.recorders.recorders_cfg import ActionStateRecorderManagerCfg
-from isaaclab.managers import DatasetExportMode
+from isaaclab.managers import DatasetExportMode, RecorderManagerBaseCfg
 
 import isaaclab_mimic.envs  # noqa: F401 — registers Isaac-*-Mimic-v0
 
@@ -722,12 +722,16 @@ def main():
         env_cfg.seed = args_cli.seed
 
     # Recorder: write *successful* demos only (env auto-flushes on terminate).
-    env_cfg.recorders = ActionStateRecorderManagerCfg()
-    env_cfg.recorders.dataset_export_dir_path = output_dir
-    env_cfg.recorders.dataset_filename = output_filename
-    env_cfg.recorders.dataset_export_mode = (
-        DatasetExportMode.EXPORT_NONE if args_cli.no_record else DatasetExportMode.EXPORT_SUCCEEDED_ONLY
-    )
+    if args_cli.no_record:
+        # No recorder terms at all: otherwise every step's obs (incl. camera images)
+        # is buffered on the GPU even when nothing is exported.
+        env_cfg.recorders = RecorderManagerBaseCfg()
+        env_cfg.recorders.dataset_export_mode = DatasetExportMode.EXPORT_NONE
+    else:
+        env_cfg.recorders = ActionStateRecorderManagerCfg()
+        env_cfg.recorders.dataset_export_dir_path = output_dir
+        env_cfg.recorders.dataset_filename = output_filename
+        env_cfg.recorders.dataset_export_mode = DatasetExportMode.EXPORT_SUCCEEDED_ONLY
 
     # --- Env + expert --------------------------------------------------------
     env = gym.make(args_cli.task, cfg=env_cfg).unwrapped
@@ -938,4 +942,13 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception:
+        # An uncaught exception otherwise leaves the Kit app running (hung) forever.
+        import traceback
+
+        traceback.print_exc()
+        sys.stdout.flush()
+        sys.stderr.flush()
+        os._exit(1)
