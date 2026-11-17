@@ -76,6 +76,42 @@ parser.add_argument(
     default=20,
     help="Number of initial scripted policy attempts to record as video.",
 )
+# --- Analysis / debugging flags (all default to the original behaviour) -----
+parser.add_argument("--no_noise", action="store_true", help="Zero all target, rotation and action noise.")
+parser.add_argument("--no_record", action="store_true", help="Do not export an HDF5 dataset (for probe runs).")
+parser.add_argument("--seed", type=int, default=None, help="Env seed (initial-pose randomisation).")
+parser.add_argument(
+    "--fsm_log",
+    type=str,
+    default=None,
+    help="Directory for per-step FSM log (steps.csv) and per-episode summary (episodes.csv).",
+)
+parser.add_argument("--verbose_fsm", action="store_true", help="Per-step debug prints (default: GUI mode only).")
+parser.add_argument(
+    "--episodes_per_env",
+    type=int,
+    default=0,
+    help="Stop once every env has completed this many episodes (any outcome). 0 = disabled.",
+)
+# --- Probe hooks for tolerance tests (Phase 1). Unset = Markovian default. ---
+parser.add_argument("--probe_grasp_xy", type=str, default=None, help="'dx,dy' (m) world offset of grasp point from bore.")
+parser.add_argument("--probe_grasp_yaw_deg", type=float, default=None, help="World yaw (deg) of top-down grasp.")
+parser.add_argument("--probe_insert_xy", type=str, default=None, help="'dx,dy' (m) bore-vs-shaft XY error held in INSERT.")
+parser.add_argument("--probe_insert_yaw_deg", type=float, default=None, help="Yaw error (deg) added to mesh target.")
+parser.add_argument(
+    "--probe_insert_latch",
+    action="store_true",
+    help="Once INSERT is entered, stay in INSERT (while grasped) until insert depth. Auto-on with --probe_insert_xy.",
+)
+parser.add_argument(
+    "--probe_hold",
+    type=str,
+    default=None,
+    help="'POINT:N[,POINT:N]' freeze-hold N steps once per episode. POINT in "
+    "pre_grasp, grasp, hover, mid_insert, bottom, release.",
+)
+parser.add_argument("--probe_z_pregrasp", type=float, default=None, help="Override Z_PREGRASP (m).")
+parser.add_argument("--probe_z_transport", type=float, default=None, help="Override Z_TRANSPORT (m).")
 
 AppLauncher.add_app_launcher_args(parser)
 args_cli = parser.parse_args()
@@ -93,6 +129,7 @@ simulation_app = app_launcher.app
 # Remaining imports.
 # ---------------------------------------------------------------------------
 import math
+import sys
 import time
 
 import cv2
@@ -206,6 +243,49 @@ ACTION_NOISE_STD_ROT = 0.02
 
 # =========================================================================== #
 
+# Line-buffer stdout so progress prints survive an abrupt exit.
+try:
+    sys.stdout.reconfigure(line_buffering=True)
+except Exception:
+    pass
+
+if args_cli.no_noise:
+    NOISE_STD_XY = NOISE_STD_Z = NOISE_STD_ROT = 0.0
+    ACTION_NOISE_STD_POS = ACTION_NOISE_STD_ROT = 0.0
+if args_cli.probe_z_pregrasp is not None:
+    Z_PREGRASP = args_cli.probe_z_pregrasp
+if args_cli.probe_z_transport is not None:
+    Z_TRANSPORT = args_cli.probe_z_transport
+
+VERBOSE_FSM = args_cli.verbose_fsm or not args_cli.headless
+
+
+def _parse_xy(s):
+    if s is None:
+        return None
+    dx, dy = (float(v) for v in s.split(","))
+    return (dx, dy)
+
+
+PROBE_GRASP_XY = _parse_xy(args_cli.probe_grasp_xy)
+PROBE_INSERT_XY = _parse_xy(args_cli.probe_insert_xy)
+PROBE_INSERT_LATCH = args_cli.probe_insert_latch or PROBE_INSERT_XY is not None
+HOLD_POINTS = ("pre_grasp", "grasp", "hover", "mid_insert", "bottom", "release")
+PROBE_HOLDS: dict = {}
+if args_cli.probe_hold:
+    for tok in args_cli.probe_hold.split(","):
+        name, n = tok.split(":")
+        assert name in HOLD_POINTS, f"unknown hold point {name!r}"
+        PROBE_HOLDS[name] = int(n)
+# Transition (prev_state, new_state) that triggers each hold, and the gripper held during it.
+HOLD_TRIGGERS = {
+    "pre_grasp": (("MOVE_TO_GEAR_Z", "GRASP_GEAR"), +1.0),
+    "grasp": (("GRASP_GEAR", "RAISE_GEAR_Z"), -1.0),
+    "hover": (("MOVE_TO_PEG_XY", "INSERT"), -1.0),
+    "bottom": (("INSERT", "RELEASE"), -1.0),
+    "release": (("RELEASE", "RETREAT_UP"), +1.0),
+}
+
 
 INITIAL_FSM_STATE = "MOVE_TO_GEAR_XY"
 
@@ -275,10 +355,58 @@ class GearAssemblyScriptedExpert:
         # (it isn't exposed via the policy obs). Stays optional so the class
         # is still constructible without an env for unit testing.
         self.env = env
+        # Probe-only bookkeeping (inactive unless --probe_hold is given).
+        self.hold_remaining: list[int] = [0] * num_envs
+        self.hold_gripper: list[float] = [GRIPPER_OPEN_CMD] * num_envs
+        self.holds_fired: list[set] = [set() for _ in range(num_envs)]
 
     def reset_env(self, env_idx: int) -> None:
         """Reset the FSM for a single env (called when that env terminates)."""
         self.fsm_state[env_idx] = INITIAL_FSM_STATE
+        self.hold_remaining[env_idx] = 0
+        self.holds_fired[env_idx] = set()
+
+    def update_holds(self, prev_state: str, new_state: str, obs: dict, env_idx: int) -> None:
+        """Probe: arm a freeze-hold the first time a configured hold point is reached."""
+        if not PROBE_HOLDS or self.hold_remaining[env_idx] > 0:
+            return
+        fired = self.holds_fired[env_idx]
+        for name, n in PROBE_HOLDS.items():
+            if name in fired:
+                continue
+            if name == "mid_insert":
+                z = float(obs["policy"]["eef_pos"][env_idx][2])
+                hit = new_state == "INSERT" and z < 0.5 * (Z_TRANSPORT + Z_INSERT_DEPTH)
+                grip = GRIPPER_CLOSE_CMD
+            else:
+                (a, b), grip = HOLD_TRIGGERS[name]
+                hit = prev_state == a and new_state == b
+            if hit:
+                fired.add(name)
+                self.hold_remaining[env_idx] = n
+                self.hold_gripper[env_idx] = grip
+                return
+
+    def _grasp_ref_xy(self, bore: torch.Tensor) -> torch.Tensor:
+        """XY the gripper aims at when grasping (bore + optional probe offset)."""
+        if PROBE_GRASP_XY is None:
+            return bore[:2]
+        return bore[:2] + torch.tensor(PROBE_GRASP_XY, dtype=bore.dtype, device=bore.device)
+
+    def _insert_ref_xy(self, shaft_pos: torch.Tensor) -> torch.Tensor:
+        """XY the bore is driven to during INSERT (shaft + optional probe error)."""
+        if PROBE_INSERT_XY is None:
+            return shaft_pos[:2]
+        return shaft_pos[:2] + torch.tensor(PROBE_INSERT_XY, dtype=shaft_pos.dtype, device=shaft_pos.device)
+
+    def mesh_yaw_error_deg(self, env_idx: int, gear_quat: torch.Tensor) -> float:
+        """Signed yaw error (deg) of the held gear vs. the mesh target, wrapped to ±half tooth period."""
+        if self.env is None:
+            return float("nan")
+        medium_yaw = _yaw_from_quat(self.env.scene["gear_medium"].data.root_quat_w[env_idx])
+        period = 2.0 * math.pi / LARGE_GEAR_NUM_TEETH
+        err = _yaw_from_quat(gear_quat) - medium_yaw - math.radians(RELATIVE_YAW_OFFSET_DEG)
+        return math.degrees(((err + period / 2.0) % period) - period / 2.0)
 
     def _mesh_yaw_target_quat(
         self,
@@ -326,6 +454,8 @@ class GearAssemblyScriptedExpert:
         # Canonical (one representative of the equivalence class) target yaw
         # for the large gear.
         canonical_target_gear_yaw = medium_yaw + math.radians(RELATIVE_YAW_OFFSET_DEG)
+        if args_cli.probe_insert_yaw_deg is not None:
+            canonical_target_gear_yaw += math.radians(args_cli.probe_insert_yaw_deg)
 
         # Wrap the required gear rotation into [-period/2, +period/2). Using
         # Python's floor-mod (always non-negative for positive divisor) means
@@ -348,22 +478,33 @@ class GearAssemblyScriptedExpert:
         gear_quat = pol["gear_quat"][env_idx]  # (4,)
         shaft_pos = pol["shaft_pos"][env_idx]  # (3,)
         gripper_pos = pol["gripper_pos"][env_idx]  # (2,)
-        print(f"    eef_pos: {eef_pos}")
-        print(f"    gear_pos: {gear_pos}")
-        print(f"    gear_quat: {gear_quat}")
-        print(f"    shaft_pos: {shaft_pos}")
-        print(f"    gripper_pos: {gripper_pos}")
+        if VERBOSE_FSM:
+            print(f"    eef_pos: {eef_pos}")
+            print(f"    gear_pos: {gear_pos}")
+            print(f"    gear_quat: {gear_quat}")
+            print(f"    shaft_pos: {shaft_pos}")
+            print(f"    gripper_pos: {gripper_pos}")
 
         bore = _bore_world(gear_pos, gear_quat)
 
         grasped = math.fabs(gripper_pos[0] - gripper_pos[1]) < GRIPPER_CLOSED_THRESHOLD
         gear_on_table = float(gear_pos[2]) < (Z_TABLE + Z_TABLE_TOL)
-        print(f"    grasped: {grasped}")
-        print(f"    gear_on_table: {gear_on_table}")
+        if VERBOSE_FSM:
+            print(f"    grasped: {grasped}")
+            print(f"    gear_on_table: {gear_on_table}")
+
+        # Probe latch: hold INSERT (ignoring the 2 mm XY gate) until insertion depth.
+        if (
+            PROBE_INSERT_LATCH
+            and self.fsm_state[env_idx] == "INSERT"
+            and grasped
+            and float(eef_pos[2]) > Z_INSERT_DEPTH + Z_TOL
+        ):
+            return "INSERT"
 
         if gear_on_table and not grasped:
             # "grasping" bucket.
-            eef_xy_to_bore = float(torch.linalg.vector_norm(eef_pos[:2] - bore[:2]))
+            eef_xy_to_bore = float(torch.linalg.vector_norm(eef_pos[:2] - self._grasp_ref_xy(bore)))
             eef_z_to_grasp_z = float(math.fabs(eef_pos[2] - Z_GRASP))
             if eef_xy_to_bore > XY_TOL:
                 return "MOVE_TO_GEAR_XY"
@@ -388,8 +529,14 @@ class GearAssemblyScriptedExpert:
     def compute_action(self, obs: dict, env_idx: int) -> torch.Tensor:
         """Compute the 7D action for ``env_idx`` given ``self.fsm_state[env_idx]``."""
         state = self.fsm_state[env_idx]
-        print(f"STATE: {state}")
+        if VERBOSE_FSM:
+            print(f"STATE: {state}")
         pol = obs["policy"]
+        # Probe freeze-hold: zero motion, fixed gripper.
+        if self.hold_remaining[env_idx] > 0:
+            self.hold_remaining[env_idx] -= 1
+            dev, dt = pol["eef_pos"].device, pol["eef_pos"].dtype
+            return torch.tensor([0, 0, 0, 0, 0, 0, self.hold_gripper[env_idx]], dtype=dt, device=dev)
         eef_pos = pol["eef_pos"][env_idx]  # (3,)
         gear_pos = pol["gear_pos"][env_idx]
         gear_quat = pol["gear_quat"][env_idx]
@@ -405,18 +552,24 @@ class GearAssemblyScriptedExpert:
         target_quat: torch.Tensor | None = None
         gripper = GRIPPER_OPEN_CMD
 
+        grasp_xy = self._grasp_ref_xy(bore)
+        insert_xy = self._insert_ref_xy(shaft_pos)
+
         if state == "MOVE_TO_GEAR_XY":
-            target_pos[0] = bore[0]
-            target_pos[1] = bore[1]
+            target_pos[0] = grasp_xy[0]
+            target_pos[1] = grasp_xy[1]
             target_pos[2] = Z_PREGRASP
             # Align the gripper to "vertical" (top-down) before descending so
             # the fingers come down straight onto the gear regardless of any
             # orientation drift accumulated by the IK-rel controller.
-            target_quat = torch.tensor(GRASP_QUAT_WXYZ, dtype=dtype, device=device)
+            if args_cli.probe_grasp_yaw_deg is None:
+                target_quat = torch.tensor(GRASP_QUAT_WXYZ, dtype=dtype, device=device)
+            else:
+                target_quat = _topdown_quat_with_yaw(math.radians(args_cli.probe_grasp_yaw_deg), dtype, device)
             gripper = GRIPPER_OPEN_CMD
         elif state == "MOVE_TO_GEAR_Z":
-            target_pos[0] = bore[0]
-            target_pos[1] = bore[1]
+            target_pos[0] = grasp_xy[0]
+            target_pos[1] = grasp_xy[1]
             target_pos[2] = Z_GRASP
             gripper = GRIPPER_OPEN_CMD
         elif state == "GRASP_GEAR":
@@ -435,8 +588,8 @@ class GearAssemblyScriptedExpert:
             target_quat = self._mesh_yaw_target_quat(env_idx, gear_quat, dtype, device)
             gripper = GRIPPER_CLOSE_CMD
         elif state == "INSERT":
-            target_pos[0] = eef_pos[0] + (shaft_pos[0] - bore[0])
-            target_pos[1] = eef_pos[1] + (shaft_pos[1] - bore[1])
+            target_pos[0] = eef_pos[0] + (insert_xy[0] - bore[0])
+            target_pos[1] = eef_pos[1] + (insert_xy[1] - bore[1])
             target_pos[2] = Z_INSERT_DEPTH
             # Hold the same gear-relative-to-medium yaw while descending.
             target_quat = self._mesh_yaw_target_quat(env_idx, gear_quat, dtype, device)
@@ -565,11 +718,16 @@ def main():
     decimation = env_cfg.decimation
     env_cfg.episode_length_s = float(args_cli.max_steps_per_demo * decimation * sim_dt)
 
+    if args_cli.seed is not None:
+        env_cfg.seed = args_cli.seed
+
     # Recorder: write *successful* demos only (env auto-flushes on terminate).
     env_cfg.recorders = ActionStateRecorderManagerCfg()
     env_cfg.recorders.dataset_export_dir_path = output_dir
     env_cfg.recorders.dataset_filename = output_filename
-    env_cfg.recorders.dataset_export_mode = DatasetExportMode.EXPORT_SUCCEEDED_ONLY
+    env_cfg.recorders.dataset_export_mode = (
+        DatasetExportMode.EXPORT_NONE if args_cli.no_record else DatasetExportMode.EXPORT_SUCCEEDED_ONLY
+    )
 
     # --- Env + expert --------------------------------------------------------
     env = gym.make(args_cli.task, cfg=env_cfg).unwrapped
@@ -604,6 +762,35 @@ def main():
     total_episodes = 0
     total_successes = 0
 
+    # Per-env completed-episode counters (for --episodes_per_env) and optional FSM logs.
+    completed_per_env = [0] * env.num_envs
+    ep_start_info: list[dict | None] = [None] * env.num_envs
+    steps_f = episodes_f = None
+    if args_cli.fsm_log:
+        os.makedirs(args_cli.fsm_log, exist_ok=True)
+        steps_f = open(os.path.join(args_cli.fsm_log, "steps.csv"), "w")
+        steps_f.write(
+            "env,ep,step,state,hold,eef_x,eef_y,eef_z,eef_grasp_xy,bore_shaft_xy,bore_z_minus_shaft,"
+            "gear_z,f1,f2,grasped,yaw_err_deg\n"
+        )
+        episodes_f = open(os.path.join(args_cli.fsm_log, "episodes.csv"), "w")
+        episodes_f.write("env,ep,counted,gear_x,gear_y,gear_yaw_deg,outcome,length\n")
+
+    def _log_step(i: int, ep: int, step: int) -> None:
+        pol = obs["policy"]
+        eef = pol["eef_pos"][i]
+        gp, gq, sp, fp = pol["gear_pos"][i], pol["gear_quat"][i], pol["shaft_pos"][i], pol["gripper_pos"][i]
+        bore = _bore_world(gp, gq)
+        g_xy = float(torch.linalg.vector_norm(eef[:2] - expert._grasp_ref_xy(bore)))
+        bs_xy = float(torch.linalg.vector_norm(bore[:2] - sp[:2]))
+        grasped = abs(float(fp[0]) - float(fp[1])) < GRIPPER_CLOSED_THRESHOLD
+        steps_f.write(
+            f"{i},{ep},{step},{expert.fsm_state[i]},{int(expert.hold_remaining[i] > 0)},"
+            f"{float(eef[0]):.5f},{float(eef[1]):.5f},{float(eef[2]):.5f},{g_xy:.5f},{bs_xy:.5f},"
+            f"{float(bore[2] - sp[2]):.5f},{float(gp[2]):.5f},{float(fp[0]):.5f},{float(fp[1]):.5f},"
+            f"{int(grasped)},{expert.mesh_yaw_error_deg(i, gq):.3f}\n"
+        )
+
     # Video recording setup
     videos_dir = os.path.join(output_dir, "scripted_videos")
     videos_started = 0
@@ -614,7 +801,7 @@ def main():
         os.makedirs(videos_dir, exist_ok=True)
         # Find camera keys in the policy obs dict
         pol = obs["policy"] if isinstance(obs, dict) and "policy" in obs else obs
-        video_cam_keys = sorted([k for k in pol.keys() if k.startswith("cam_") or k.endswith("_cam")])
+        video_cam_keys = sorted([k for k in pol.keys() if "cam" in k])
         if not video_cam_keys:
             print("[scripted_expert] Warning: --n-video-trials > 0 but no camera obs keys detected.")
         
@@ -624,11 +811,26 @@ def main():
                 videos_started += 1
                 frame_buffers[i].append(_make_video_frame(obs, i, video_cam_keys))
 
-    while simulation_app.is_running():
+    total_episodes_started = 0
+    stop_requested = False
+    while simulation_app.is_running() and not stop_requested:
         with torch.inference_mode():
             # 1) Update FSM state per env from the current obs.
             for i in range(env.num_envs):
+                if episode_steps[i] == 0:
+                    gp, gq = obs["policy"]["gear_pos"][i], obs["policy"]["gear_quat"][i]
+                    ep_start_info[i] = {
+                        "ep": total_episodes_started,
+                        "x": float(gp[0]),
+                        "y": float(gp[1]),
+                        "yaw": math.degrees(_yaw_from_quat(gq)),
+                    }
+                    total_episodes_started += 1
+                prev_state = expert.fsm_state[i]
                 expert.fsm_state[i] = expert.compute_FSM_state(obs, i)
+                expert.update_holds(prev_state, expert.fsm_state[i], obs, i)
+                if steps_f is not None:
+                    _log_step(i, ep_start_info[i]["ep"], episode_steps[i])
 
             # 2) Compute per-env action, then stack into a (num_envs, 7) tensor.
             # The IK-rel arm action is 6D + 1D gripper = 7D total.
@@ -651,37 +853,39 @@ def main():
         for i in range(env.num_envs):
             episode_steps[i] += 1
 
-        # Track recorder progress.
-        current_exported = env.recorder_manager.exported_successful_episode_count
-        if current_exported > last_exported:
-            new = current_exported - last_exported
-            last_exported = current_exported
-            total = existing_demos + current_exported
-            tgt_str = f"/{args_cli.num_demos}" if args_cli.num_demos > 0 else ""
-            print(f"[scripted_expert] +{new} successful demo(s)  →  total: {total}{tgt_str}")
-            if args_cli.num_demos > 0 and total >= args_cli.num_demos:
-                print("[scripted_expert] target reached, exiting.")
-                break
-
         # Per-env reset bookkeeping: the env auto-resets envs whose terminated /
         # truncated fired, so we just reset the FSM string for those envs.
+        # (Done before the --num_demos exit check so the final episode's video
+        # and summary line are not lost.)
         done = (terminated | truncated).cpu()
         for i in range(env.num_envs):
             if bool(done[i]):
                 is_success = bool(terminated[i])
                 outcome = "SUCCESS" if is_success else "TIMEOUT"
-                total_episodes += 1
-                if is_success:
-                    total_successes += 1
-                rate = total_successes / total_episodes
+                counted = args_cli.episodes_per_env <= 0 or completed_per_env[i] < args_cli.episodes_per_env
+                completed_per_env[i] += 1
+                if counted:
+                    total_episodes += 1
+                    if is_success:
+                        total_successes += 1
+                rate = total_successes / max(total_episodes, 1)
                 print(
                     f"[scripted_expert] env {i} episode ended ({outcome}) after"
                     f" {episode_steps[i]} steps. Success rate so far:"
                     f" {total_successes}/{total_episodes} ({rate:.1%})."
                 )
-                
+                if episodes_f is not None and ep_start_info[i] is not None:
+                    s = ep_start_info[i]
+                    episodes_f.write(
+                        f"{i},{s['ep']},{int(counted)},{s['x']:.5f},{s['y']:.5f},{s['yaw']:.2f},"
+                        f"{outcome},{episode_steps[i]}\n"
+                    )
+                    episodes_f.flush()
+                    steps_f.flush()
+
                 if args_cli.n_video_trials > 0 and record_env[i]:
-                    video_path = os.path.join(videos_dir, f"trial_{total_episodes:04d}_{outcome}.mp4")
+                    ep_id = ep_start_info[i]["ep"] if ep_start_info[i] is not None else total_episodes
+                    video_path = os.path.join(videos_dir, f"trial_{ep_id:04d}_env{i}_{outcome}.mp4")
                     _write_mp4(frame_buffers[i], video_path, fps=10)
                     print(f"[scripted_expert] Saved video: {video_path}")
                     frame_buffers[i] = []
@@ -696,6 +900,22 @@ def main():
                 expert.reset_env(i)
                 last_logged_state[i] = None
 
+        # Track recorder progress.
+        current_exported = env.recorder_manager.exported_successful_episode_count
+        if current_exported > last_exported:
+            new = current_exported - last_exported
+            last_exported = current_exported
+            total = existing_demos + current_exported
+            tgt_str = f"/{args_cli.num_demos}" if args_cli.num_demos > 0 else ""
+            print(f"[scripted_expert] +{new} successful demo(s)  →  total: {total}{tgt_str}")
+            if args_cli.num_demos > 0 and total >= args_cli.num_demos:
+                print("[scripted_expert] target reached, exiting.")
+                stop_requested = True
+
+        if args_cli.episodes_per_env > 0 and min(completed_per_env) >= args_cli.episodes_per_env:
+            print(f"[scripted_expert] every env completed {args_cli.episodes_per_env} episode(s), exiting.")
+            stop_requested = True
+
         if rate_limit:
             elapsed = time.time() - last_step_time
             sleep = max(0.0, 1.0 / target_hz - elapsed)
@@ -705,6 +925,13 @@ def main():
 
     final_total = existing_demos + env.recorder_manager.exported_successful_episode_count
     print(f"[scripted_expert] done. Final demo count in {args_cli.dataset_file}: {final_total}.")
+    print(
+        f"[scripted_expert] SUMMARY counted_episodes={total_episodes} successes={total_successes} "
+        f"rate={total_successes / max(total_episodes, 1):.3f}"
+    )
+    if steps_f is not None:
+        steps_f.close()
+        episodes_f.close()
 
     env.close()
     simulation_app.close()
